@@ -198,4 +198,17 @@ jobs:
           EOF
 
       - name: Run Playwright
+        id: playwright
         run: npm run test:e2e
+
+      # Screenshots, traces, and videos exist only after a failed Playwright
+      # run. Upload them so a red end-to-end test can be inspected later.
+      # Vitest failures do not produce these files.
+      - name: Upload Playwright failure artifacts
+        if: failure() && steps.playwright.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failure-artifacts
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
