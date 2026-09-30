@@ -133,6 +133,134 @@ date comparison.
 
 ---
 
+## Bonus: Load Testing
+
+### Target and rationale
+
+The load test targets:
+
+GET /api/catalogues/premium-corporate-essentials/search
+
+This was selected because it is a public, read-only, database-backed search endpoint that exercises a realistic buyer-facing catalogue path without creating or modifying enquiry data.
+
+The test deliberately uses the published `premium-corporate-essentials` catalogue rather than the known draft/expired catalogues, because the assessment already identifies access-control/lifecycle defects there and those endpoints are not necessary for establishing a safe read-only baseline.
+
+### Method
+
+The load test uses a dependency-free Node.js script with the Node 20 built-in `fetch` API.
+
+Configuration:
+- 10 concurrent closed-loop workers
+- 30-second measurement window
+- Each worker waits for its current request to finish before starting the next
+- Queries rotate through: `atlas`, `TRV`, `flask`, `a`, and `zzzz`
+- One warmup request per worker before measurement
+- Warmup requests are excluded from all measured metrics
+- 5-second per-request timeout
+- HTTP 200 is treated as success, including an empty result set
+- Non-200 responses, fetch failures, and timeouts are measured as failures
+- Percentiles use nearest-rank calculation
+- No latency SLA/pass threshold is imposed because the assessment does not define one
+
+### Baseline results
+
+The baseline was run locally against the seeded eight-product catalogue.
+
+| Metric | Result |
+|---|---:|
+| Concurrency | 10 |
+| Duration | 30 seconds |
+| Total measured requests | 8,750 |
+| Successful requests | 8,750 |
+| Failed requests | 0 |
+| Error rate | 0.00% |
+| Requests/sec | 291.52 |
+| Minimum latency | 10.97 ms |
+| P50 | 28.44 ms |
+| P95 | 47.75 ms |
+| P99 | 90.00 ms |
+| Maximum latency | 1,157.55 ms |
+| HTTP 200 responses | 8,750 |
+| Warmup success | 10/10 |
+
+### Interpretation and limitations
+
+The endpoint completed all 8,750 measured requests successfully during this local baseline, with no measured HTTP or fetch failures. P95 latency was 47.75 ms and P99 latency was 90.00 ms.
+
+The 1,157.55 ms maximum is recorded as a long-tail observation, not as a performance failure, because no SLA is defined by the assessment.
+
+This result should not be interpreted as production capacity. The test runs against a local Next.js/PostgreSQL environment and the seeded catalogue contains only eight products. It therefore does not represent realistic production catalogue size, network conditions, infrastructure, or database capacity.
+
+### Follow-up load-testing work
+
+If more time were available, I would repeat the test with a materially larger catalogue and production-like infrastructure, then compare latency and error rates across increasing concurrency levels. I would also investigate the long-tail latency observed in the baseline and evaluate search performance as the catalogue grows, including whether the current database search pattern requires indexing or another query strategy.
+
+---
+
+## Bonus: AI Extraction Thinking
+
+### Proposed use case
+
+For messy seller-provided catalogue data, AI could assist with extracting structured product fields such as product name, SKU, description, price, minimum order quantity, available quantity, category, and other supported catalogue fields from semi-structured text or spreadsheets.
+
+The AI should be treated as an extraction assistant, not as an authority. Deterministic validation must remain responsible for deciding whether extracted values are acceptable.
+
+### QA risks
+
+I would test at least:
+
+- Missing fields
+- Ambiguous field names
+- Conflicting values
+- Incorrect field mapping
+- Hallucinated values that were not present in the source
+- Incorrect numeric parsing
+- Currency and decimal handling
+- MOQ versus available quantity confusion
+- Negative or zero quantities where invalid
+- Extremely large values
+- Duplicate SKUs
+- Unsupported categories
+- Mixed-language or unusual formatting
+- Malformed or partially corrupted input
+- Prompt/instruction text embedded inside seller data
+- Attempts to cause the model to ignore extraction rules
+
+### Validation strategy
+
+For each extraction, I would preserve the original input alongside the structured result so the result can be audited.
+
+The automated checks should compare extracted values against deterministic business rules rather than only checking that the model returned JSON.
+
+Examples:
+- Required fields must be present.
+- Price must be numeric and within accepted business bounds.
+- MOQ and available quantity must remain separate fields.
+- SKU must follow the supported format.
+- Quantities must satisfy the product's validation rules.
+- Values that cannot be confidently extracted should remain unresolved rather than being invented.
+
+### Confidence and human review
+
+I would define confidence thresholds for fields where incorrect extraction could have commercial impact.
+
+High-confidence deterministic fields could proceed automatically. Low-confidence or conflicting values should be flagged for human review rather than silently committed.
+
+For example, if the source says "minimum order: 100" and another field says "stock: 100", the system must not infer that the two values are interchangeable.
+
+### Regression approach
+
+I would maintain a curated corpus of representative seller inputs containing clean examples, messy spreadsheets, ambiguous headers, currency variations, missing values, duplicate products, and deliberately adversarial inputs.
+
+Every model or prompt change would be evaluated against this corpus, with particular attention to:
+- extraction accuracy
+- field-level validation failures
+- false values introduced by the model
+- previously-correct examples becoming incorrect
+- safety/security regressions
+
+The key QA principle would be: AI may suggest structured data, but deterministic validation and explicit human review should control whether commercially important data is accepted.
+
 ## Notes
 
 - Node 20, Docker Postgres on `localhost:5544`. Docker Desktop was not
