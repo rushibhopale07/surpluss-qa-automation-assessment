@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: catalogue
+          POSTGRES_PASSWORD: catalogue
+          POSTGRES_DB: catalogue
+        ports:
+          - 5544:5432
+        options: >-
+          --health-cmd "pg_isready -U catalogue -d catalogue"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://catalogue:catalogue@localhost:5544/catalogue
+      DIRECT_URL: postgresql://catalogue:catalogue@localhost:5544/catalogue
+      AUTH_SECRET: local-development-secret-do-not-use-in-production
+      NEXTAUTH_URL: http://localhost:3001
+      APP_URL: http://localhost:3001
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Apply migrations
+        run: npm run db:deploy
+
+      - name: Seed database
+        run: npm run db:seed
+
+      # The suite exits 1 on purpose: 10 regression tests document open bugs.
+      # continue-on-error is only on this step so the validator can read the
+      # JSON report. Those failures are not ignored.
+      - name: Run Vitest
+        continue-on-error: true
+        run: npx vitest run --no-file-parallelism --reporter=json --outputFile=vitest-report.json
+
+      # Accepts the run only when the failure set is exactly the 10 known
+      # assessment findings (33 passed, 10 failed, 43 total, none skipped).
+      # A new failure, a known finding that starts passing, or a count change
+      # exits 1 and fails CI.
+      - name: Validate known Vitest findings
+        run: |
+          node <<'EOF'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const reportPath = path.resolve("vitest-report.json");
+          const expected = {
+            total: 43,
+            passed: 33,
+            failed: 10,
+          };
+
+          // File path + title, not the title alone: a renamed suite or a duplicate
+          // title cannot satisfy this set by accident.
+          const knownFindings = [
+            ["tests/api/public-catalogue.test.ts", "does not expose draft catalogue contents or prices to an anonymous caller"],
+            ["tests/api/public-catalogue.test.ts", "does not return offer prices for a catalogue whose validity date has passed"],
+            ["tests/api/public-catalogue.test.ts", "does not create a lead against a draft catalogue"],
+            ["tests/api/public-catalogue.test.ts", "does not create a lead against an expired catalogue"],
+            ["tests/api/admin-access.test.ts", "deleteCatalogue refuses staff, because deleting destroys lead history"],
+            ["tests/api/admin-access.test.ts", "PATCH /api/admin/catalogues/:id refuses a staff user publishing a draft"],
+            ["tests/api/admin-access.test.ts", "createCatalogueWithProducts refuses staff when publish is true"],
+            ["tests/api/admin-access.test.ts", "does not update a listing that belongs to a different catalogue"],
+            ["tests/unit/catalogue-status.test.ts", "treats a published catalogue past its validity date as expired"],
+            ["tests/unit/catalogue-status.test.ts", "keeps a published catalogue with a future validity date as published"],
+          ];
+
+          function fail(messages) {
+            for (const message of messages) console.error(message);
+            process.exit(1);
+          }
+
+          if (!fs.existsSync(reportPath)) {
+            fail([`Vitest report is missing: ${reportPath}`]);
+          }
+
+          let report;
+          try {
+            report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+          } catch (error) {
+            fail([`Vitest report is malformed: ${error instanceof Error ? error.message : String(error)}`]);
+          }
+
+          if (!report || !Array.isArray(report.testResults)) {
+            fail(["Vitest report is malformed: testResults is missing."]);
+          }
+
+          function relativeFile(filePath) {
+            return path.relative(process.cwd(), filePath).split(path.sep).join("/");
+          }
+
+          function identity(filePath, title) {
+            return `${relativeFile(filePath)} :: ${title}`;
+          }
+
+          const assertions = [];
+          for (const fileResult of report.testResults) {
+            if (!fileResult || typeof fileResult.name !== "string" || !Array.isArray(fileResult.assertionResults)) {
+              fail(["Vitest report is malformed: a test result is missing name or assertionResults."]);
+            }
+            for (const assertion of fileResult.assertionResults) {
+              if (!assertion || typeof assertion.title !== "string" || typeof assertion.status !== "string") {
+                fail(["Vitest report is malformed: an assertion is missing title or status."]);
+              }
+              assertions.push({
+                file: fileResult.name,
+                title: assertion.title,
+                status: assertion.status,
+                key: identity(fileResult.name, assertion.title),
+              });
+            }
+          }
+
+          const knownKeys = knownFindings.map(([file, title]) => `${file} :: ${title}`);
+          const knownSet = new Set(knownKeys);
+          const failedAssertions = assertions.filter((assertion) => assertion.status === "failed");
+          const passedCount = assertions.filter((assertion) => assertion.status === "passed").length;
+          const otherStatuses = assertions.filter(
+            (assertion) => assertion.status !== "passed" && assertion.status !== "failed",
+          );
+          const failedSet = new Set(failedAssertions.map((assertion) => assertion.key));
+          const unexpected = [...failedSet].filter((key) => !knownSet.has(key));
+          const knownNotFailing = knownKeys.filter((key) => !failedSet.has(key));
+
+          console.log(
+            `Vitest counts: total=${report.numTotalTests} passed=${report.numPassedTests} failed=${report.numFailedTests} pending=${report.numPendingTests} todo=${report.numTodoTests}`,
+          );
+          console.log("Failing tests (known assessment findings):");
+          if (failedAssertions.length === 0) console.log("- none");
+          for (const assertion of failedAssertions) {
+            console.log(`- ${assertion.key}`);
+          }
+
+          const problems = [];
+          if (assertions.length === 0 || report.numTotalTests === 0) {
+            problems.push("The suite produced no tests.");
+          }
+          if (report.numTotalTests !== expected.total || assertions.length !== expected.total) {
+            problems.push(`Expected ${expected.total} tests, got summary ${report.numTotalTests} and ${assertions.length} assertions.`);
+          }
+          if (report.numPassedTests !== expected.passed || passedCount !== expected.passed) {
+            problems.push(`Expected ${expected.passed} passing tests, got summary ${report.numPassedTests} and ${passedCount} passing assertions.`);
+          }
+          if (report.numFailedTests !== expected.failed || failedAssertions.length !== expected.failed) {
+            problems.push(`Expected ${expected.failed} failing tests, got summary ${report.numFailedTests} and ${failedAssertions.length} failing assertions.`);
+          }
+          if (report.numPendingTests !== 0 || report.numTodoTests !== 0 || otherStatuses.length > 0) {
+            const skipped = otherStatuses.map((assertion) => `${assertion.key} (${assertion.status})`);
+            problems.push(
+              `Skipped or unfinished tests are not accepted (pending=${report.numPendingTests}, todo=${report.numTodoTests}): ${skipped.join("; ") || "see summary counts"}`,
+            );
+          }
+          if (failedSet.size !== failedAssertions.length) {
+            problems.push("Duplicate failing test identities in the report.");
+          }
+          if (unexpected.length > 0) {
+            problems.push(`New failing tests:\n- ${unexpected.join("\n- ")}`);
+          }
+          if (knownNotFailing.length > 0) {
+            problems.push(
+              `Known assessment findings did not fail (fixed, removed, or skipped):\n- ${knownNotFailing.join("\n- ")}`,
+            );
+          }
+
+          if (problems.length > 0) fail(problems);
+          console.log("Failure set matches the 10 known assessment findings.");
+          EOF
+
+      - name: Run Playwright
+        run: npm run test:e2e
